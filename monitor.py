@@ -92,9 +92,8 @@ class TCError(Exception):
 
 def checkibalance():
     '''attempts to disable irqbalance'''
+    #If irqbalance is not installed, this will "fail," but that's fine, as long as irqbalance isn't running
     stat = subprocess.check_call(['service','irqbalance','stop'])
-    global SKIPAFFINITY
-    SKIPAFFINITY = 0
     return 0
 
 def pollcpu():
@@ -112,6 +111,7 @@ def pollaffinity(irqlist):
     '''determines the current affinity scenario'''
     affinity = dict()
     for i in irqlist:
+        #each of these files corresponds to the hexadecimal bitmask over which cpu(s) the irq is affinitized to.
         pfile = open('/proc/irq/{}/smp_affinity'.format(i),'r')
         thisAffinity=pfile.read().strip()
         affinity[i]=thisAffinity
@@ -133,6 +133,7 @@ def pollirq(iface):
         irqfile.close()
         return irqlist
     driver = subprocess.check_output(['ethtool','-i',iface])
+    #Mellanox doesn't always report their NICs as ethX
     if 'mlx4' in driver:
         irqfile.seek(0)
         for line in irqfile:
@@ -148,6 +149,10 @@ def pollirq(iface):
 
 def setaffinity(affy,numcpus):
     '''naively sets the affinity based on industry best practices for a multiqueue NIC'''
+    #In order for RFS to do its job, each queue (represented by an irq#) needs to correspond to 1 and only 1 CPU.
+    #The goals are as follows: use as many CPUs as possible, such that iff the number of irqs>number of CPUs, two irqs may share a CPU.
+    #The target of further development will be to create a CPU blacklist of oversubscribed CPUs that we will exclude from this process based on a variety of factors.
+
     numdigits = numcpus/4
     mask = 1
     irqcount = 0
@@ -167,6 +172,8 @@ def setaffinity(affy,numcpus):
 
 def setperformance(numcpus):
     '''sets all cpus to performance mode'''
+    #This is perhaps somewhat contraversial in practice, but essential for accurate testing.
+    #In practice, you are going to be disk-limited, but we're trying to eliminate the possibility of a CPU frequency scaling being the limiting factor.
     for i in range(numcpus):
         throttle = open('/sys/devices/system/cpu/cpu{}/cpufreq/scaling_governor'.format(i), 'w')
         throttle.write('performance')
@@ -175,29 +182,37 @@ def setperformance(numcpus):
 
 def getlinerate(iface):
     '''uses ethtool to determine the linerate of the selected interface'''
+    #I think this is essential, and will certainly become essential for the receiver: You shouldn't throttle higher than your line rate (you might as well not throttle).
     out = subprocess.check_output(['ethtool',iface])
     speed = re.search('.+Speed:.+',out)
     speed = re.sub('.+Speed:\s','',speed.group(0))
     speed = re.sub('Mb/s','',speed)
     if 'Unknown' in speed:
+        #There should be a better way to check that the interface is disabled...
         raise TCError(Exception,'Line rate for this interface is unknown: interface could be disabled')
     return speed
 
 def setthrottles(iface):
     '''sets predefined common throttles in tc'''
     try:
+        #Make sure there is no root qdisc
         stat = subprocess.check_call(['tc','qdisc','del','dev',iface,'root'])
     except subprocess.CalledProcessError as e:
-        #Might get here because there is no root qdisc...
+        #Might get here because there was no root qdisc...
         if e.returncode != 2:
             raise e
+    #Now we add an htb root qdisc
     subprocess.check_call(['tc','qdisc','add','dev',iface,'handle','1:','root','htb'])
     for speedclass in SPEEDCLASSES:
+        #Now we add a class for each speedclass
         subprocess.check_call(['tc','class','add','dev',iface,'parent','1:','classid',speedclass[1],'htb','rate',str(speedclass[0])+'mbit'])
+    #we'll do the filters when we actually have flows/subnets to filter
     return
 
-def loadconnections(connections,filename,timeout,verbose):
-    '''oversees pushing the connections into the database'''
+def loadconnections(connections,filename,json,timeout,verbose):
+    '''oversees pushing the given connections into the database'''
+    #Sentinel representing invalid result is -1
+    #This is a vestige of an old organization: this db connection should be made once in doconns and the cursor should be passed around.
     conn = conn = sqlite3.connect(filename)
     c = conn.cursor()
     numnew,numupdated = 0,0
@@ -213,26 +228,38 @@ def loadconnections(connections,filename,timeout,verbose):
             logging.warning(connection+' had an invalid cwnd.')
             continue
         if retrans<0:
-            #see if parsetcp will handle it
-            logging.warning(connection+' had an invalid retrans.')
+            #see if parsetcp will handle it--that's why there's no continue here
+            logging.warning(connection+' had an invalid retrans reported by ss.')
         iface = findiface(ips[1])
         try:
+            #the last 2 arguments are interval and flownum, respectively
+            #interval is incremented every time the row is touched--we're assumuing this connection has never been seen before, so we leave it at 0
+            #flownum allows us to take flows that have the same TCP 4-tuple, and tell them apart based on a delay (timeout) from the last time they were seen. This addresses the issue of multiple consecutive flows with the same 4-tuple being seen as a single, huge flow.
             dbinsert(c,ips[0],ips[1],ports[0],ports[1],rtt,wscaleavg,cwnd,retrans,iface,0,0)
             numnew +=1
         except sqlite3.IntegrityError:
             #We already have it in the database
             #I'm looking for a way to do this in one query in SQLite
+            #Check if we grabbed this flow's data in the last couple of intervals or so...
             flownum,recent = dbcheckrecent(c,ips[0],ips[1],ports[0],ports[1],timeout)
+            #If we haven't seen it recently, just create a new row with a higher flownumber
             if not recent:
                 flownum+=1
                 dbinsert(c,ips[0],ips[1],ports[0],ports[1],rtt,wscaleavg,cwnd,retrans,iface,0,flownum)
                 numnew +=1
+                #this is when we want to dump the previous flow's data, for now.
+                #but we need a way to do this that doesn't depend on seeing the same flow twice.
+                if json:
+                    dumplast(sourceip,destip,sourceport,destport,flownum-1,json)
             else:
+                #just update the appropriate values in the database row
                 intervals = int(dbselectval(c,ips[0],ips[1],ports[0],ports[1],'intervals'))
                 intervals += 1
+                #we are trying to gather the minimum reported average RTT:
                 oldrtt = int(dbselectval(c,ips[0],ips[1],ports[0],ports[1],'rttavg'))
                 if 0<oldrtt<rtt:
                     rtt = oldrtt
+                #everything else gets updated to the latest values.
                 dbupdateconn(c,ips[0],ips[1],ports[0],ports[1],rtt,wscaleavg,cwnd,retrans,iface,intervals,flownum)
                 numupdated +=1
     conn.commit()
@@ -241,8 +268,13 @@ def loadconnections(connections,filename,timeout,verbose):
         when=datetime.datetime.now().strftime('%Y/%m/%d %H:%M:%s')))
     return
 
+def dumplast(sourceip,destip,sourceport,destport,flownum,json):
+    '''json dump of last completed connection'''
+    pass
+
 def dbcheckrecent(cur, sourceip, destip, sourceport, destport, timeout):
-    '''checks to see if this flow has been recently seen'''
+    '''checks to see if this flow has been seen within timeout'''
+    #we naively check the flow with the highest flownum
     query = '''SELECT flownum FROM conns WHERE
         sourceip = \'{sip}\' AND
         destip = \'{dip}\' AND
@@ -268,14 +300,17 @@ def isip6(ip):
         socket.inet_aton(ip)
         return False
     except socket.error:
-        socket.inet_pton(socket.AF_INET6,ip)
-        return True
+        try:
+            socket.inet_pton(socket.AF_INET6,ip)
+            return True
+        except socket.error:
+            return -1
 
 def findiface(ip):
     '''determines the interface responsible for a particular ip address'''
     ip6 = isip6(ip)
     if ip6 == -1:
-        #Propagating falsehoods...
+        #propagate failure to caller--we don't even know what ip call to make
         return -1
     elif ip6:
         dev = subprocess.check_output(['ip','-6','route','get',ip])
@@ -373,7 +408,7 @@ def dbinsert(cur, sourceip, destip, sourceport, destport, rtt, wscaleavg, cwnd, 
     return
 
 def dbupdateconn(cur, sourceip, destip, sourceport, destport, rtt, wscaleavg, cwnd, retrans, iface, intervals, flownum):
-    '''assembles a query and updates the corresponding row in the database'''
+    '''assembles a query and updates the entire corresponding row in the database'''
     if retrans == -1: #don't update it: let parsetcp take care of it.
         query = '''UPDATE conns SET
         iface = \'{ifa}\',
@@ -445,6 +480,24 @@ def dbselectval(cur, sourceip, destip, sourceport, destport, selectfield):
         return out[0][0]
     return -1
 
+def dbselectall(cur, sourceip, destip, sourceport, destport, flownum):
+    '''returns the entire given row from the database'''
+    query = '''SELECT * FROM conns WHERE
+    sourceip = \'{sip}\' AND
+    destip = \'{dip}\' AND
+    sourceport = {spo} AND
+    destport = {dpo} AND
+    flownum = {fnm}'''.format(
+        sval=selectfield,
+        sip=sourceip,
+        dip=destip,
+        spo=sourceport,
+        dpo=destport,
+        fnm=flownum)
+    cur.execute(query)
+    out = cur.fetchall()
+    return out
+
 def dbupdateval(cur, sourceip, destip, sourceport, destport, updatefield, updateval):
     '''updates a particular value in the database'''
     if type(updateval) == str:
@@ -468,6 +521,7 @@ def dbinit(filename):
     conn = sqlite3.connect(filename)
     c = conn.cursor()
     try:
+        #see if it's already there...
         c.execute('''SELECT * FROM conns''')
     except sqlite3.OperationalError:
         logging.warning('Table doesn\'t exist; Creating table...')
@@ -491,11 +545,14 @@ def dbinit(filename):
 
 def throttleoutgoing(iface,ipaddr,speedclass):
     '''throttles an outgoing flow'''
+    #Need a decent rx linerate estimate in order to do this; became skeptical of tc's sendrate
     success = subprocess.check_call(['tc','filter','add',iface,'parent','1:','protocol','ip','prio','1','u32','match','ip','dst',ipaddr+'/32','flowid',speedclass[1]])
     return success
 
 def pollss():
     '''gets data from ss'''
+    #ss is being used to get statistics about tcp flows.
+    #however, it doesn't always approprately report retransmits, so sometimes...
     out = subprocess.check_output(['ss','-i','-t','-n'])
     out = re.sub('\A.+\n','',out)
     out = re.sub('\n\t','',out)
@@ -504,6 +561,7 @@ def pollss():
 
 def polltcp():
     '''gets data from /proc/net/tcp'''
+    #...we have to access /proc/net/tcp
     tcp = open('/proc/net/tcp','r')
     out = tcp.readlines()
     out = out[1:]
@@ -523,9 +581,11 @@ def parsetcp(connections,filename):
     for connection in connections:
         connection = connection.strip()
         connection = connection.split()
+        #con't care about localhost connections
         if connection[1] != '00000000:0000' and connection[2] != '00000000:0000':
             sourceip = connection[1].split(':')[0]
             sourceport = connection[1].split(':')[1]
+            #have to convert the packed hex to a valid IP address
             sourceip = int(sourceip,16)
             sourceip = struct.pack('<L',sourceip)
             sourceip = socket.inet_ntoa(sourceip)
@@ -548,11 +608,8 @@ def doconns(interval,filename,json,timeout,verbose):
     '''manages the periodic collection of ss and procfs data'''
     connections = pollss()
     tcpconns = polltcp()
-    if json:
-        pass
-    else:
-        loadconnections(connections,filename,timeout,verbose)
-        parsetcp(tcpconns,filename)
+    loadconnections(connections,filename,json,timeout,verbose)
+    parsetcp(tcpconns,filename)
     logging.info('successful interval')
     threading.Timer(interval, doconns, [interval,filename,json,timeout,verbose]).start()
     return
@@ -617,10 +674,10 @@ USAGE
             with the same ports and destination are considered new.''')
         parser.add_argument('-a','--affinitize',
             action='store_true',
-            help='Affinitize and optimize the system.')
+            help='Affinitize and optimize the system. Must supply an interface.')
         parser.add_argument('-r','--throttle',
             action='store_true',
-            help='Actively shape connections, rather than just collecting data.')
+            help='Future: Actively shape connections, rather than just collecting data.')
         parser.add_argument('-v','--verbose',
             action='store_true',
             help='Don\'t summarize connections in the database.')
@@ -631,6 +688,8 @@ USAGE
         interval = args.interval
         if args.throttle and not args.interface:
             raise CLIError('Please supply an interface to throttle with the -i option.')
+        if args.affinitize and not args.interface:
+            raise CLIError('Please supply an interface to affinitize with the -i option.')
         if args.timeout:
             timeout = args.timeout
         if timeout < interval:
