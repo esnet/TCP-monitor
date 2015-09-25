@@ -27,7 +27,7 @@ DEBUG = 0
 TESTRUN = 1
 SKIPAFFINITY = 1
 
-#Error Handling Philosophy: These are sort of placeholders for the impending
+#Error Handling: These are sort of placeholders for the impending
 #modularization of this monolithic script. This will be done to allow the
 #monitoring components to limp along, even if affinitization and throttling
 #aren't working.
@@ -217,7 +217,10 @@ def loadconnections(connections,filename,json,timeout,verbose):
     c = conn.cursor()
     numnew,numupdated = 0,0
     for connection in connections:
-        ips, ports, rtt, wscaleavg, cwnd, retrans = parseconnection(connection)
+        ips, ports, mss, rtt, wscaleavg, cwnd, unacked, retrans, lost = parseconnection(connection)
+        if mss<0:
+            logging.warning(connection+' had an invalid mss')
+            continue
         if rtt<0:
             logging.warning(connection+' had an invalid rtt.')
             continue
@@ -235,7 +238,7 @@ def loadconnections(connections,filename,json,timeout,verbose):
             #the last 2 arguments are interval and flownum, respectively
             #interval is incremented every time the row is touched--we're assumuing this connection has never been seen before, so we leave it at 0
             #flownum allows us to take flows that have the same TCP 4-tuple, and tell them apart based on a delay (timeout) from the last time they were seen. This addresses the issue of multiple consecutive flows with the same 4-tuple being seen as a single, huge flow.
-            dbinsert(c,ips[0],ips[1],ports[0],ports[1],rtt,wscaleavg,cwnd,retrans,iface,0,0)
+            dbinsert(c,ips[0],ips[1],ports[0],ports[1],mss,rtt,wscaleavg,cwnd,unacked,retrans,lost,iface,0,0)
             numnew +=1
         except sqlite3.IntegrityError:
             #We already have it in the database
@@ -245,12 +248,12 @@ def loadconnections(connections,filename,json,timeout,verbose):
             #If we haven't seen it recently, just create a new row with a higher flownumber
             if not recent:
                 flownum+=1
-                dbinsert(c,ips[0],ips[1],ports[0],ports[1],rtt,wscaleavg,cwnd,retrans,iface,0,flownum)
+                dbinsert(c,ips[0],ips[1],ports[0],ports[1],mss,rtt,wscaleavg,cwnd,unacked,retrans,lost,iface,0,flownum)
                 numnew +=1
                 #this is when we want to dump the previous flow's data, for now.
                 #but we need a way to do this that doesn't depend on seeing the same flow twice.
-                if json:
-                    dumplast(sourceip,destip,sourceport,destport,flownum-1,json)
+                #if json:
+                #    dumplast(sourceip,destip,sourceport,destport,flownum-1,json)
             else:
                 #just update the appropriate values in the database row
                 intervals = int(dbselectval(c,ips[0],ips[1],ports[0],ports[1],'intervals'))
@@ -260,7 +263,7 @@ def loadconnections(connections,filename,json,timeout,verbose):
                 if 0<oldrtt<rtt:
                     rtt = oldrtt
                 #everything else gets updated to the latest values.
-                dbupdateconn(c,ips[0],ips[1],ports[0],ports[1],rtt,wscaleavg,cwnd,retrans,iface,intervals,flownum)
+                dbupdateconn(c,ips[0],ips[1],ports[0],ports[1],mss,rtt,wscaleavg,cwnd,unacked,retrans,lost,iface,intervals,flownum)
                 numupdated +=1
     conn.commit()
     conn.close()
@@ -330,15 +333,22 @@ def parseconnection(connection):
         ordered = connection.split()
         ips = re.findall('\d+\.\d+\.\d+\.\d+',connection)
         ports = re.findall('\d:\w+',connection)
+        mss = re.search('mss:\d+',connection)
         rtt = re.search('rtt:\d+[.]?\d+',connection)
         wscaleavg = re.search('wscale:\d+',connection)
         cwnd = re.search('cwnd:\d+',connection)
+        unacked = re.search('unacked:\d+',connection)
         retrans = re.search('retrans:\d+\/\d+',connection)
+        lost = re.search('lost:\d+',connection)
     except Exception as e:
         if TEST or DEBUG:
             raise e
         logging.warning('connection {} could not be parsed'.format(connection))
-        return -1,-1,-1,-1,-1,-1
+        return -1,-1,-1,-1,-1,-1,-1,-1,-1
+    if mss:
+        mss = int(mss.group(0)[4:])
+    else:
+        mss = -1
     if rtt:
         rtt = float(rtt.group(0)[4:])
     else:
@@ -351,19 +361,27 @@ def parseconnection(connection):
         cwnd = cwnd.group(0)[5:]
     else:
         cwnd = -1
+    if unacked:
+        unacked = int(unacked.group(0)[8:])
+    else:
+        unacked = -1
     if retrans:
         retrans = retrans.group(0)
         retrans = re.sub('retrans:\d+\/','',retrans)
     else:
         retrans = -1
-    if len(ips) > 1 and len(ports) > 1 and rtt and wscaleavg and cwnd and retrans:
+    if lost:
+        lost = int(lost.group(0)[5:])
+    else:
+        lost = -1
+    if len(ips) > 1 and len(ports) > 1:
         ports[0] = ports[0][2:]
         ports[1] = ports[1][2:]
-        return ips, ports, rtt, wscaleavg, cwnd, retrans
+        return ips, ports, mss, rtt, wscaleavg, cwnd, unacked, retrans, lost
     logging.warning('connection {} could not be parsed'.format(connection))
-    return -1,-1,-1,-1,-1,-1
+    return -1,-1,-1,-1,-1,-1,-1,-1,-1
 
-def dbinsert(cur, sourceip, destip, sourceport, destport, rtt, wscaleavg, cwnd, retrans, iface, intervals, flownum):
+def dbinsert(cur, sourceip, destip, sourceport, destport, mss, rtt, wscaleavg, cwnd, unacked, retrans, lost, iface, intervals, flownum):
     '''assembles a query and creates a corresponding row in the database'''
     query = '''INSERT INTO conns (
         sourceip,
@@ -372,10 +390,13 @@ def dbinsert(cur, sourceip, destip, sourceport, destport, rtt, wscaleavg, cwnd, 
         destport,
         flownum,
         iface,
+        mss,
         rttavg,
         wscaleavg,
         cwnd,
+        unacked,
         retrans,
+        lost,
         intervals,
         created,
         modified)
@@ -386,10 +407,13 @@ def dbinsert(cur, sourceip, destip, sourceport, destport, rtt, wscaleavg, cwnd, 
             {dpo},
             {fnm},
             \'{ifa}\',
+            {ms},
             {rt},
             {wsc},
             {cnd},
+            {una},
             {retr},
+            {lst},
             {intv},
             datetime(CURRENT_TIMESTAMP),
             datetime(CURRENT_TIMESTAMP))'''.format(
@@ -399,22 +423,28 @@ def dbinsert(cur, sourceip, destip, sourceport, destport, rtt, wscaleavg, cwnd, 
             dpo=destport,
             fnm=flownum,
             ifa=iface,
+            ms=mss,
             rt=rtt,
             wsc=wscaleavg,
             cnd=cwnd,
+            una=unacked,
             retr=retrans,
+            lst=lost,
             intv=intervals)
     cur.execute(query)
     return
 
-def dbupdateconn(cur, sourceip, destip, sourceport, destport, rtt, wscaleavg, cwnd, retrans, iface, intervals, flownum):
+def dbupdateconn(cur, sourceip, destip, sourceport, destport, mss, rtt, wscaleavg, cwnd, unacked, retrans, lost, iface, intervals, flownum):
     '''assembles a query and updates the entire corresponding row in the database'''
     if retrans == -1: #don't update it: let parsetcp take care of it.
         query = '''UPDATE conns SET
         iface = \'{ifa}\',
+        mss = {ms},
         rttavg = {rt},
         wscaleavg = {wsc},
         cwnd = {cnd},
+        unacked = {una},
+        lost = {lst},
         intervals = {intv},
         modified = datetime(CURRENT_TIMESTAMP)
         WHERE
@@ -429,17 +459,23 @@ def dbupdateconn(cur, sourceip, destip, sourceport, destport, rtt, wscaleavg, cw
             dpo=destport,
             fnm=flownum,
             ifa=iface,
+            ms=mss,
             rt=rtt,
             wsc=wscaleavg,
             cnd=cwnd,
+            una=unacked,
+            lst=lost,
             intv=intervals)
     else:
         query = '''UPDATE conns SET
         iface = \'{ifa}\',
+        mss = {ms},
         rttavg = {rt},
         wscaleavg = {wsc},
         cwnd = {cnd},
+        unacked = {una},
         retrans = {retr},
+        lost = {lst},
         intervals = {intv},
         modified = datetime(CURRENT_TIMESTAMP)
         WHERE
@@ -454,10 +490,13 @@ def dbupdateconn(cur, sourceip, destip, sourceport, destport, rtt, wscaleavg, cw
             dpo=destport,
             fnm=flownum,
             ifa=iface,
+            ms=mss,
             rt=rtt,
             wsc=wscaleavg,
             cnd=cwnd,
+            una=unacked,
             retr=retrans,
+            lst=lost,
             intv=intervals)
     cur.execute(query)
     return
@@ -531,11 +570,16 @@ def dbinit(filename):
             sourceport  int     NOT NULL,
             destport    int     NOT NULL,
             flownum     int     NOT NULL,
+            rxq         int,
+            txq         int,
+            mss         int,
             iface       text,
             rttavg      real,
             wscaleavg   real,
             cwnd        int,
+            unacked     int,
             retrans     int,
+            lost        int,
             intervals   int,
             created     datetime,
             modified    datetime,
@@ -637,6 +681,7 @@ def main(argv=None): # IGNORE:C0111
     program_version_message = '%%(prog)s {v} ({b})'.format(v=program_version, b=program_build_date)
     program_shortdesc = __import__('__main__').__doc__.split('\n')[1]
     program_license = '''{}
+
 
 
 USAGE
